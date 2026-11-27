@@ -391,4 +391,44 @@ all_history = []
 for strategy in ["HA Micro", "5-Candle Breakout"]:
     hist = st.session_state.history[strategy]
     all_history.extend(hist)
-    with st.expander(f"{strategy} · {len(hist)} closed trades
+    with st.expander(f"{strategy} · {len(hist)} closed trades", expanded=False):
+        if hist:
+            hdf = pd.DataFrame(hist)
+            wins = int((hdf["P/L USDT"] > 0).sum())
+            winrate = wins/len(hdf)*100
+            netpnl = float(hdf["P/L USDT"].sum())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Win rate", f"{winrate:.1f}%")
+            m2.metric("Wins / Losses", f"{wins} / {len(hdf)-wins}")
+            m3.metric("Net realized P/L", f"{netpnl:.4f} USDT")
+            st.dataframe(hdf, width="stretch", hide_index=True)
+        else:
+            st.caption("No completed trades yet.")
+
+# Save button + export download: account data is also auto-saved on every trade/settings change.
+sv1, sv2 = st.columns(2)
+with sv1:
+    if st.button("💾 Save Paper Account Now", use_container_width=True):
+        save_state_to_db()
+        st.success(f"Saved to local database: {DB_PATH.name}")
+with sv2:
+    csv_data = pd.DataFrame(all_history).to_csv(index=False) if all_history else "Coin,Strategy,Entry,Exit,Amount,Fees,P/L USDT,Exit Reason,Opened,Closed\n"
+    st.download_button("⬇️ Download Trade History CSV", data=csv_data, file_name="ScalpX_paper_trade_history.csv", mime="text/csv", use_container_width=True)
+
+st.caption(f"Database file: {DB_PATH.name} · Paper account data is saved locally. Back up this file if moving the bot to another laptop.")
+
+st.subheader("⚠️ Reset Paper Account")
+confirm_reset = st.checkbox("I understand this will reset balance, open positions and history to a new paper account.")
+if st.button("♻️ Reset account to 10,000 USDT", disabled=not confirm_reset):
+    st.session_state.balance = 10000.0
+    st.session_state.initial_balance = 10000.0
+    st.session_state.positions = []
+    st.session_state.history = {"HA Micro": [], "5-Candle Breakout": []}
+    st.session_state.monitor_messages = []
+    st.session_state.scan_results = {"HA Micro": [], "5-Candle Breakout": []}
+    st.session_state.scan_errors = {"HA Micro": [], "5-Candle Breakout": []}
+    save_state_to_db()
+    st.success("Paper account reset to 10,000 USDT and saved.")
+    st.rerun()
+
+st.caption("Paper simulation only. No Binance order is sent. Auto-monitoring runs only while this Streamlit session is active; keep the app/browser open. If the app/server is stopped or the connection sleeps, checks pause. Signals are experimental and can be false.")
