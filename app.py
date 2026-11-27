@@ -1,40 +1,135 @@
 import streamlit as st
 import requests
 import pandas as pd
+import sqlite3
+import json
 from datetime import datetime
+from pathlib import Path
 
 st.set_page_config(page_title="ScalpX Pro | Paper", page_icon="⚡", layout="wide")
 st.title("⚡ ScalpX Pro — Dual Paper Scanners")
 st.caption("Binance Spot market data · Paper trading only · No real orders")
 
-COINS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "DOGEUSDT", "TRXUSDT", "LINKUSDT", "AVAXUSDT"]
+# ----- Coin watchlist: first 24 receive priority, followed by another 26 -----
+TOP_24 = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT",
+    "ADAUSDT", "TRXUSDT", "LINKUSDT", "AVAXUSDT", "BCHUSDT", "DOTUSDT",
+    "LTCUSDT", "TONUSDT", "SUIUSDT", "XLMUSDT", "SHIBUSDT", "HBARUSDT",
+    "UNIUSDT", "AAVEUSDT", "NEARUSDT", "ETCUSDT", "FILUSDT", "ICPUSDT"
+]
+EXTRA_26 = [
+    "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "ATOMUSDT", "RENDERUSDT",
+    "FETUSDT", "TAOUSDT", "SEIUSDT", "TIAUSDT", "JUPUSDT", "WIFUSDT",
+    "PEPEUSDT", "BONKUSDT", "FLOKIUSDT", "GALAUSDT", "SANDUSDT", "MANAUSDT",
+    "MKRUSDT", "CRVUSDT", "LDOUSDT", "ZECUSDT", "VETUSDT", "ALGOUSDT",
+    "EOSUSDT", "PAXGUSDT"
+]
+COINS = TOP_24 + EXTRA_26
 BASE = "https://data-api.binance.vision/api/v3"
+DB_PATH = Path(__file__).resolve().parent / "scalpx_paper.sqlite3"
 
-def init(key, value):
+# ----- SQLite persistence -----
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS paper_state (id INTEGER PRIMARY KEY CHECK(id=1), data_json TEXT NOT NULL, saved_at TEXT NOT NULL)")
+    return conn
+
+def default_state():
+    return {
+        "balance": 10000.0,
+        "initial_balance": 10000.0,
+        "positions": [],
+        "history": {"HA Micro": [], "5-Candle Breakout": []},
+        "monitor_messages": [],
+        "settings": {"target_pct": 0.30, "stop_pct": 0.20, "amount": 1000.0, "fee_pct": 0.10}
+    }
+
+def load_saved_state():
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT data_json FROM paper_state WHERE id=1").fetchone()
+        if row:
+            st.session_state._paper_db_has_saved_state = True
+            loaded = json.loads(row[0])
+            state = default_state()
+            state.update(loaded)
+            state["settings"] = {**default_state()["settings"], **loaded.get("settings", {})}
+            state["history"] = {**default_state()["history"], **loaded.get("history", {})}
+            return state
+        st.session_state._paper_db_has_saved_state = False
+    except Exception as err:
+        st.session_state._paper_db_has_saved_state = False
+        st.warning(f"Could not read saved paper account: {err}")
+    return default_state()
+
+def save_state_to_db():
+    payload = {
+        "balance": float(st.session_state.balance),
+        "initial_balance": float(st.session_state.initial_balance),
+        "positions": st.session_state.positions,
+        "history": st.session_state.history,
+        "monitor_messages": st.session_state.monitor_messages,
+        "settings": {
+            "target_pct": float(st.session_state.get("setting_target_pct", 0.30)),
+            "stop_pct": float(st.session_state.get("setting_stop_pct", 0.20)),
+            "amount": float(st.session_state.get("setting_amount", 1000.0)),
+            "fee_pct": float(st.session_state.get("setting_fee_pct", 0.10)),
+        }
+    }
+    with db_connect() as conn:
+        conn.execute("INSERT INTO paper_state(id, data_json, saved_at) VALUES(1, ?, ?) ON CONFLICT(id) DO UPDATE SET data_json=excluded.data_json, saved_at=excluded.saved_at",
+                     (json.dumps(payload, ensure_ascii=False), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+if "persistence_initialized" not in st.session_state:
+    # If the previous version is still running in this Streamlit session, migrate its
+    # in-memory paper account on first launch of this persistent version.
+    saved = load_saved_state()
+    if not st.session_state.get("_paper_db_has_saved_state", False) and all(k in st.session_state for k in ("balance", "positions", "history")):
+        saved["balance"] = st.session_state.balance
+        saved["initial_balance"] = st.session_state.get("initial_balance", 1000.0)
+        saved["positions"] = st.session_state.positions
+        saved["history"] = st.session_state.history
+        saved["monitor_messages"] = st.session_state.get("monitor_messages", [])
+    st.session_state.balance = saved["balance"]
+    st.session_state.initial_balance = saved["initial_balance"]
+    st.session_state.positions = saved["positions"]
+    st.session_state.history = saved["history"]
+    st.session_state.monitor_messages = saved.get("monitor_messages", [])
+    st.session_state.setting_target_pct = saved["settings"]["target_pct"]
+    st.session_state.setting_stop_pct = saved["settings"]["stop_pct"]
+    st.session_state.setting_amount = saved["settings"]["amount"]
+    st.session_state.setting_fee_pct = saved["settings"]["fee_pct"]
+    st.session_state.persistence_initialized = True
+
+# Session-only scan state (paper account and trade records are persisted separately).
+def init_session(key, value):
     if key not in st.session_state:
         st.session_state[key] = value
 
-init("balance", 1000.0)
-init("initial_balance", 1000.0)
-init("positions", [])
-init("history", {"HA Micro": [], "5-Candle Breakout": []})
-init("scan_results", {"HA Micro": [], "5-Candle Breakout": []})
-init("scan_errors", {"HA Micro": [], "5-Candle Breakout": []})
-init("scanner_running", {"HA Micro": False, "5-Candle Breakout": False})
-init("scan_time", {"HA Micro": None, "5-Candle Breakout": None})
-init("monitor_last_check", None)
-init("monitor_messages", [])
+init_session("scan_results", {"HA Micro": [], "5-Candle Breakout": []})
+init_session("scan_errors", {"HA Micro": [], "5-Candle Breakout": []})
+init_session("scanner_running", {"HA Micro": False, "5-Candle Breakout": False})
+init_session("scan_time", {"HA Micro": None, "5-Candle Breakout": None})
+init_session("monitor_last_check", None)
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    target_pct = st.number_input("Target %", min_value=0.05, max_value=5.0, value=0.30, step=0.05)
-    stop_pct = st.number_input("Stop loss %", min_value=0.05, max_value=5.0, value=0.20, step=0.05)
-    amount = st.number_input("Paper trade amount (USDT)", min_value=5.0, value=100.0, step=10.0)
-    fee_pct = st.number_input("Simulated fee per side (%)", min_value=0.0, max_value=2.0, value=0.10, step=0.01)
+    target_pct = st.number_input("Target %", min_value=0.05, max_value=5.0, value=float(st.session_state.setting_target_pct), step=0.05)
+    stop_pct = st.number_input("Stop loss %", min_value=0.05, max_value=5.0, value=float(st.session_state.setting_stop_pct), step=0.05)
+    amount = st.number_input("Paper trade amount (USDT)", min_value=5.0, value=float(st.session_state.setting_amount), step=50.0)
+    fee_pct = st.number_input("Simulated fee per side (%)", min_value=0.0, max_value=2.0, value=float(st.session_state.setting_fee_pct), step=0.01)
     refresh_sec = st.selectbox("Scanner refresh interval", [5, 10, 15, 30], index=1)
     auto_refresh = st.checkbox("Auto-refresh active scanner", value=False)
     monitor_sec = st.selectbox("Open-trade monitor interval", [2, 3, 5, 10], index=1)
-    st.caption("Signals experimental. Paper trades only. Monitoring requires this browser/app session to remain open.")
+    st.caption("Paper account saves to a local SQLite file. The laptop must stay awake for monitoring to continue.")
+
+# Persist settings changes (and make the current fee available to exit calculations).
+st.session_state.setting_target_pct = target_pct
+st.session_state.setting_stop_pct = stop_pct
+st.session_state.setting_amount = amount
+st.session_state.setting_fee_pct = fee_pct
+save_state_to_db()
 
 @st.cache_data(ttl=2)
 def get_klines(symbol, interval="1m", limit=300):
@@ -97,7 +192,7 @@ def analyze_ha(symbol):
         signal = "🟡 EARLY ALERT"
     else:
         signal = "WAIT"
-    return {"Coin": symbol, "Signal": signal, "Score": int(score), "Price": float(df.close.iloc[-2]),
+    return {"Coin": symbol, "Priority": "TOP 24" if symbol in TOP_24 else "OTHER 26", "Signal": signal, "Score": int(score), "Price": float(df.close.iloc[-2]),
             "RSI": float(rsi) if pd.notna(rsi) else 50.0, "Body %": round(body_ratio*100, 1),
             "Upper wick %": round(upper_ratio*100, 1), "Volume OK": bool(volume_ok),
             "EMA9>EMA33": bool(ema9>ema33), "EMA200 trend": bool(df.close.iloc[-2]>ema200),
@@ -118,7 +213,7 @@ def analyze_block(symbol):
     volume_ok = current.volume > avg_vol
     if volume_ok: score += 20
     signal = "🚀 BLOCK BREAKOUT BUY" if breakout else ("🟡 BREAKOUT WATCH" if crossed else "WAIT")
-    return {"Coin": symbol, "Signal": signal, "Score": score, "Price": float(current.close),
+    return {"Coin": symbol, "Priority": "TOP 24" if symbol in TOP_24 else "OTHER 26", "Signal": signal, "Score": score, "Price": float(current.close),
             "Block High": block_high, "Block Low": block_low, "Current High": float(current.high),
             "Volume OK": bool(volume_ok), "Chart": f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"}
 
@@ -136,8 +231,8 @@ def close_position(pos, exit_price, reason):
     st.session_state.positions.remove(pos)
     st.session_state.monitor_messages.insert(0, f"{pos['Coin']} closed: {reason} | P/L {pnl:+.4f} USDT")
     st.session_state.monitor_messages = st.session_state.monitor_messages[:20]
+    save_state_to_db()
 
-# Continuous open-position monitoring fragment: runs independently of scanner selection.
 @st.fragment(run_every=monitor_sec)
 def trade_monitor():
     if not st.session_state.positions:
@@ -162,7 +257,6 @@ def trade_monitor():
         st.caption("Recent auto-close events:")
         for msg in st.session_state.monitor_messages[:5]:
             st.write("• " + msg)
-    # Rerun app UI after automatic exits so balance/history immediately reflect them.
     if any(x.get("Status") in ("TARGET", "STOP LOSS") for x in checked):
         st.rerun()
 
@@ -188,6 +282,8 @@ with sc3:
                 errors.append(f"{coin}: {exc}")
             progress.progress((i+1)/len(COINS))
         progress.empty()
+        # Priority group first; then higher signal score first inside each group.
+        results.sort(key=lambda x: (0 if x["Coin"] in TOP_24 else 1, -x["Score"]))
         st.session_state.scan_results[scanner_name] = results
         st.session_state.scan_errors[scanner_name] = errors
         st.session_state.scan_time[scanner_name] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -202,6 +298,7 @@ if auto_refresh and st.session_state.scanner_running[scanner_name]:
                 results.append(analyze_ha(coin) if scanner_name == "HA Micro" else analyze_block(coin))
             except Exception as exc:
                 errors.append(f"{coin}: {exc}")
+        results.sort(key=lambda x: (0 if x["Coin"] in TOP_24 else 1, -x["Score"]))
         st.session_state.scan_results[scanner_name] = results
         st.session_state.scan_errors[scanner_name] = errors
         st.session_state.scan_time[scanner_name] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -219,7 +316,7 @@ if results:
         c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
         with c1:
             st.write(f"**{r['Coin']}**")
-            st.caption(f"{r['Signal']} | Score: {r['Score']}")
+            st.caption(f"{r['Signal']} | Score: {r['Score']} | {r['Priority']}")
         with c2:
             st.write(f"Price: {r['Price']:.8f}")
         with c3:
@@ -242,6 +339,7 @@ if results:
                             "Quantity": qty, "Amount": amount, "Buy Fee": buy_fee,
                             "Target": price*(1+target_pct/100), "Stop": price*(1-stop_pct/100),
                             "Opened": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                        save_state_to_db()
                         st.success(f"Paper BUY opened: {r['Coin']} @ {price:.8f}")
                         st.rerun()
                 except Exception as exc:
@@ -289,29 +387,8 @@ st.caption(f"Checks open positions every {monitor_sec} seconds while this Stream
 trade_monitor()
 
 st.subheader("📊 Strategy Results")
+all_history = []
 for strategy in ["HA Micro", "5-Candle Breakout"]:
     hist = st.session_state.history[strategy]
-    with st.expander(f"{strategy} · {len(hist)} closed trades", expanded=False):
-        if hist:
-            hdf = pd.DataFrame(hist)
-            wins = int((hdf["P/L USDT"] > 0).sum())
-            winrate = wins/len(hdf)*100
-            netpnl = float(hdf["P/L USDT"].sum())
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Win rate", f"{winrate:.1f}%")
-            m2.metric("Wins / Losses", f"{wins} / {len(hdf)-wins}")
-            m3.metric("Net realized P/L", f"{netpnl:.4f} USDT")
-            st.dataframe(hdf, width="stretch", hide_index=True)
-        else:
-            st.caption("No completed trades yet.")
-
-if st.button("♻️ Reset paper account and strategy histories"):
-    st.session_state.balance = 1000.0
-    st.session_state.positions = []
-    st.session_state.history = {"HA Micro": [], "5-Candle Breakout": []}
-    st.session_state.scan_results = {"HA Micro": [], "5-Candle Breakout": []}
-    st.session_state.scan_errors = {"HA Micro": [], "5-Candle Breakout": []}
-    st.session_state.monitor_messages = []
-    st.rerun()
-
-st.caption("Paper simulation only. No Binance order is sent. Auto-monitoring runs only while this Streamlit session is active; keep the app/browser open. If the app/server is stopped or the connection sleeps, checks pause. Signals can be false and prices can move fast.")
+    all_history.extend(hist)
+    with st.expander(f"{strategy} · {len(hist)} closed trades
