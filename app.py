@@ -8,23 +8,18 @@ from pathlib import Path
 
 st.set_page_config(page_title="ScalpX Pro | Paper", page_icon="⚡", layout="wide")
 st.title("⚡ ScalpX Pro — Dual Paper Scanners")
-st.caption("Binance Spot market data · Paper trading only · No real orders")
+st.caption("Binance Spot market data · Paper trading only · No real orders · Focus watchlist: 10 coins")
 
-# ----- Coin watchlist: first 24 receive priority, followed by another 26 -----
-TOP_24 = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT",
-    "ADAUSDT", "TRXUSDT", "LINKUSDT", "AVAXUSDT", "BCHUSDT", "DOTUSDT",
-    "LTCUSDT", "TONUSDT", "SUIUSDT", "XLMUSDT", "SHIBUSDT", "HBARUSDT",
-    "UNIUSDT", "AAVEUSDT", "NEARUSDT", "ETCUSDT", "FILUSDT", "ICPUSDT"
+# ----- Focused watchlists -----
+# The two original scanners use the original compact 10-coin list.
+COINS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "XRPUSDT",
+    "TRXUSDT", "LINKUSDT", "DOGEUSDT", "SOLUSDT", "AVAXUSDT"
 ]
-EXTRA_26 = [
-    "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "ATOMUSDT", "RENDERUSDT",
-    "FETUSDT", "TAOUSDT", "SEIUSDT", "TIAUSDT", "JUPUSDT", "WIFUSDT",
-    "PEPEUSDT", "BONKUSDT", "FLOKIUSDT", "GALAUSDT", "SANDUSDT", "MANAUSDT",
-    "MKRUSDT", "CRVUSDT", "LDOUSDT", "ZECUSDT", "VETUSDT", "ALGOUSDT",
-    "EOSUSDT", "PAXGUSDT"
-]
-COINS = TOP_24 + EXTRA_26
+# Early Momentum also uses a focused, liquid list to reduce scan time.
+MOMENTUM_COINS = COINS.copy()
+# Pump Detector independently ranks the market by 24h quote volume.
+PUMP_TOP_N = 30
 BASE = "https://data-api.binance.vision/api/v3"
 DB_PATH = Path(__file__).resolve().parent / "scalpx_paper.sqlite3"
 
@@ -40,7 +35,7 @@ def default_state():
         "balance": 10000.0,
         "initial_balance": 10000.0,
         "positions": [],
-        "history": {"HA Micro": [], "5-Candle Breakout": []},
+        "history": {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []},
         "monitor_messages": [],
         "settings": {"target_pct": 0.30, "stop_pct": 0.20, "amount": 1000.0, "fee_pct": 0.10}
     }
@@ -107,11 +102,21 @@ def init_session(key, value):
     if key not in st.session_state:
         st.session_state[key] = value
 
-init_session("scan_results", {"HA Micro": [], "5-Candle Breakout": []})
-init_session("scan_errors", {"HA Micro": [], "5-Candle Breakout": []})
-init_session("scanner_running", {"HA Micro": False, "5-Candle Breakout": False})
-init_session("scan_time", {"HA Micro": None, "5-Candle Breakout": None})
+init_session("scan_results", {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []})
+init_session("scan_errors", {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []})
+init_session("scanner_running", {"HA Micro": False, "5-Candle Breakout": False, "HA Early Momentum": False})
+init_session("scan_time", {"HA Micro": None, "5-Candle Breakout": None, "HA Early Momentum": None})
 init_session("monitor_last_check", None)
+# Ensure keys are present when upgrading an older Streamlit session.
+for _key, _defaults in [("scan_results", {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []}),
+                         ("scan_errors", {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []}),
+                         ("scanner_running", {"HA Micro": False, "5-Candle Breakout": False, "HA Early Momentum": False}),
+                         ("scan_time", {"HA Micro": None, "5-Candle Breakout": None, "HA Early Momentum": None})]:
+    for _name, _value in _defaults.items():
+        st.session_state[_key].setdefault(_name, _value)
+init_session("pump_results", [])
+init_session("pump_errors", [])
+init_session("pump_checked", None)
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -192,7 +197,7 @@ def analyze_ha(symbol):
         signal = "🟡 EARLY ALERT"
     else:
         signal = "WAIT"
-    return {"Coin": symbol, "Priority": "TOP 24" if symbol in TOP_24 else "OTHER 26", "Signal": signal, "Score": int(score), "Price": float(df.close.iloc[-2]),
+    return {"Coin": symbol, "Priority": "FOCUS 10", "Signal": signal, "Score": int(score), "Price": float(df.close.iloc[-2]),
             "RSI": float(rsi) if pd.notna(rsi) else 50.0, "Body %": round(body_ratio*100, 1),
             "Upper wick %": round(upper_ratio*100, 1), "Volume OK": bool(volume_ok),
             "EMA9>EMA33": bool(ema9>ema33), "EMA200 trend": bool(df.close.iloc[-2]>ema200),
@@ -213,9 +218,64 @@ def analyze_block(symbol):
     volume_ok = current.volume > avg_vol
     if volume_ok: score += 20
     signal = "🚀 BLOCK BREAKOUT BUY" if breakout else ("🟡 BREAKOUT WATCH" if crossed else "WAIT")
-    return {"Coin": symbol, "Priority": "TOP 24" if symbol in TOP_24 else "OTHER 26", "Signal": signal, "Score": score, "Price": float(current.close),
+    return {"Coin": symbol, "Priority": "FOCUS 10", "Signal": signal, "Score": score, "Price": float(current.close),
             "Block High": block_high, "Block Low": block_low, "Current High": float(current.high),
             "Volume OK": bool(volume_ok), "Chart": f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"}
+
+def analyze_early_momentum(symbol):
+    """Fast HA transition scan using the current (still-forming) 1m candle."""
+    df = get_klines(symbol, "1m", 120)
+    ha = heikin_ashi(df)
+    # Last row is the live/forming candle. Previous rows are closed candles.
+    live, prev = ha.iloc[-1], ha.iloc[-2]
+    raw_live = df.iloc[-1]
+    candle_range = max(float(live.high-live.low), 1e-12)
+    body_ratio = abs(float(live.close-live.open))/candle_range
+    upper_ratio = (float(live.high)-max(float(live.open),float(live.close)))/candle_range
+    green_live = float(live.close) > float(live.open)
+    prev_red = float(prev.close) <= float(prev.open)
+    # Soft trend filter: EMA20 proximity/slope, not a strict gate.
+    ema20 = df.close.ewm(span=20, adjust=False).mean()
+    ema20_now, ema20_prev = float(ema20.iloc[-1]), float(ema20.iloc[-2])
+    soft_trend_ok = float(raw_live.close) >= ema20_now * 0.997 or ema20_now >= ema20_prev
+    vol_avg = float(df.volume.iloc[-21:-1].mean()) if len(df) >= 21 else float(df.volume.mean())
+    vol_live = float(raw_live.volume)
+    volume_ratio = vol_live / max(vol_avg, 1e-12)
+    # Avoid very late alerts: count consecutive green HA candles ending at live candle.
+    greens = 0
+    for j in range(len(ha)-1, max(-1, len(ha)-8), -1):
+        if float(ha.iloc[j].close) > float(ha.iloc[j].open): greens += 1
+        else: break
+    early = green_live and prev_red and body_ratio >= 0.22 and upper_ratio <= 0.50 and soft_trend_ok
+    momentum = green_live and body_ratio >= 0.42 and upper_ratio <= 0.30 and volume_ratio >= 1.15 and soft_trend_ok and greens <= 2
+    confirmed = momentum and float(raw_live.close) > float(df.high.iloc[-2])
+    signal = "🟢 CONFIRMED MOMENTUM" if confirmed else ("🟠 MOMENTUM" if momentum else ("🟡 EARLY REVERSAL" if early else "WAIT"))
+    score = (25 if green_live else 0) + (20 if prev_red else 0) + (20 if body_ratio >= .42 else 10 if body_ratio >= .22 else 0) + (15 if volume_ratio >= 1.15 else 0) + (10 if soft_trend_ok else 0) + (10 if greens <= 2 else 0)
+    return {"Coin":symbol, "Signal":signal, "Score":score, "Price":float(raw_live.close), "Live HA Green":green_live, "Green Streak":greens, "Body %":round(body_ratio*100,1), "Upper Wick %":round(upper_ratio*100,1), "Volume x":round(volume_ratio,2), "Soft EMA20 Filter":soft_trend_ok, "Chart":f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"}
+
+@st.cache_data(ttl=15)
+def get_top_volume_symbols(limit=30):
+    r=requests.get(f"{BASE}/ticker/24hr",timeout=15)
+    r.raise_for_status()
+    rows=r.json()
+    candidates=[x for x in rows if x.get("symbol", "").endswith("USDT") and not x["symbol"].endswith("UPUSDT") and not x["symbol"].endswith("DOWNUSDT")]
+    candidates.sort(key=lambda x:float(x.get("quoteVolume",0)),reverse=True)
+    return candidates[:limit]
+
+def analyze_pump_watch(symbol):
+    df=get_klines(symbol,"1m",35)
+    if len(df)<25: raise ValueError("Not enough candles")
+    current=df.iloc[-1]
+    prev1=df.iloc[-2]
+    prev5=df.iloc[-6]
+    change1=(float(current.close)/float(prev1.close)-1)*100
+    change5=(float(current.close)/float(prev5.close)-1)*100
+    avg_vol=float(df.volume.iloc[-21:-1].mean())
+    vol_ratio=float(current.volume)/max(avg_vol,1e-12)
+    status="WATCH"
+    if vol_ratio>=2.0 and change1>=0.15 and change5>=0.30: status="🚀 PUMP WATCH"
+    elif vol_ratio>=1.5 and change1>=0.08: status="🟡 VOLUME SPIKE"
+    return {"Coin":symbol,"Status":status,"1m %":round(change1,2),"5m %":round(change5,2),"Volume x":round(vol_ratio,2),"24h Quote Vol":None,"Chart":f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"}
 
 def close_position(pos, exit_price, reason):
     gross = pos["Quantity"] * exit_price
@@ -261,29 +321,28 @@ def trade_monitor():
         st.rerun()
 
 st.subheader("🔎 Choose and run a scanner")
-scanner_name = st.radio("Scanner", ["HA Micro", "5-Candle Breakout"], horizontal=True)
+scanner_name = st.radio("Scanner", ["HA Micro", "5-Candle Breakout", "HA Early Momentum"], horizontal=True)
+scan_coins = MOMENTUM_COINS if scanner_name == "HA Early Momentum" else COINS
 sc1, sc2, sc3 = st.columns([1, 1, 2])
 with sc1:
-    if st.button(f"▶ Start {scanner_name}", use_container_width=True):
-        st.session_state.scanner_running[scanner_name] = True
+    if st.button(f"▶ Start {scanner_name}", use_container_width=True): st.session_state.scanner_running[scanner_name] = True
 with sc2:
-    if st.button(f"⏹ Stop {scanner_name}", use_container_width=True):
-        st.session_state.scanner_running[scanner_name] = False
+    if st.button(f"⏹ Stop {scanner_name}", use_container_width=True): st.session_state.scanner_running[scanner_name] = False
 with sc3:
     if st.button(f"🔍 Scan {scanner_name} now", use_container_width=True):
         st.session_state.scanner_running[scanner_name] = True
         get_klines.clear()
         results, errors = [], []
         progress = st.progress(0)
-        for i, coin in enumerate(COINS):
+        for i, coin in enumerate(scan_coins):
             try:
-                results.append(analyze_ha(coin) if scanner_name == "HA Micro" else analyze_block(coin))
-            except Exception as exc:
-                errors.append(f"{coin}: {exc}")
-            progress.progress((i+1)/len(COINS))
+                if scanner_name == "HA Micro": results.append(analyze_ha(coin))
+                elif scanner_name == "5-Candle Breakout": results.append(analyze_block(coin))
+                else: results.append(analyze_early_momentum(coin))
+            except Exception as exc: errors.append(f"{coin}: {exc}")
+            progress.progress((i+1)/len(scan_coins))
         progress.empty()
-        # Priority group first; then higher signal score first inside each group.
-        results.sort(key=lambda x: (0 if x["Coin"] in TOP_24 else 1, -x["Score"]))
+        results.sort(key=lambda x: -x["Score"])
         st.session_state.scan_results[scanner_name] = results
         st.session_state.scan_errors[scanner_name] = errors
         st.session_state.scan_time[scanner_name] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -293,12 +352,13 @@ if auto_refresh and st.session_state.scanner_running[scanner_name]:
     @st.fragment(run_every=refresh_sec)
     def auto_scan_fragment():
         results, errors = [], []
-        for coin in COINS:
+        for coin in scan_coins:
             try:
-                results.append(analyze_ha(coin) if scanner_name == "HA Micro" else analyze_block(coin))
-            except Exception as exc:
-                errors.append(f"{coin}: {exc}")
-        results.sort(key=lambda x: (0 if x["Coin"] in TOP_24 else 1, -x["Score"]))
+                if scanner_name == "HA Micro": results.append(analyze_ha(coin))
+                elif scanner_name == "5-Candle Breakout": results.append(analyze_block(coin))
+                else: results.append(analyze_early_momentum(coin))
+            except Exception as exc: errors.append(f"{coin}: {exc}")
+        results.sort(key=lambda x: -x["Score"])
         st.session_state.scan_results[scanner_name] = results
         st.session_state.scan_errors[scanner_name] = errors
         st.session_state.scan_time[scanner_name] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -310,6 +370,32 @@ if results:
     st.caption(f"Last scan: {st.session_state.scan_time[scanner_name] or '—'}")
     st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True,
                  column_config={"Chart": st.column_config.LinkColumn("TradingView Chart", display_text="Open Chart")})
+    # Side-panel Pump Detector: only scans when user presses its button.
+    pump_col, main_col = st.columns([1, 2])
+    with pump_col:
+        st.subheader("🚀 Pump Detector")
+        st.caption("Top-volume USDT coins · alert/watch only · not a buy signal")
+        if st.button("🔎 Scan Pump Watch", key="pump_scan_button", use_container_width=True):
+            with st.spinner("Checking high-volume coins..."):
+                pump_rows, pump_errors = [], []
+                try:
+                    symbols=[x["symbol"] for x in get_top_volume_symbols(PUMP_TOP_N)]
+                    for sym in symbols:
+                        try: pump_rows.append(analyze_pump_watch(sym))
+                        except Exception as ex: pump_errors.append(f"{sym}: {ex}")
+                    pump_rows.sort(key=lambda x:(0 if "PUMP WATCH" in x["Status"] else 1, -x["Volume x"], -x["5m %"]))
+                    st.session_state.pump_results=pump_rows
+                    st.session_state.pump_errors=pump_errors
+                    st.session_state.pump_checked=datetime.now().strftime("%H:%M:%S")
+                except Exception as ex: st.error(f"Pump detector failed: {ex}")
+        if st.session_state.pump_results:
+            st.caption(f"Updated: {st.session_state.pump_checked}")
+            st.dataframe(pd.DataFrame(st.session_state.pump_results), hide_index=True, width="stretch", column_config={"Chart":st.column_config.LinkColumn("Chart",display_text="Chart")})
+            if st.session_state.pump_errors:
+                with st.expander("Pump scan errors"): st.write(st.session_state.pump_errors)
+        else: st.info("Press Scan Pump Watch to check the market.")
+    with main_col:
+        st.caption("Main scanner results and paper trading")
     st.subheader("🛒 Manual Paper BUY — Any Scanned Coin")
     st.caption("BUY is available for every scanned coin, including WAIT signals. Paper trades only.")
     for r in results:
@@ -388,7 +474,7 @@ trade_monitor()
 
 st.subheader("📊 Strategy Results")
 all_history = []
-for strategy in ["HA Micro", "5-Candle Breakout"]:
+for strategy in ["HA Micro", "5-Candle Breakout", "HA Early Momentum"]:
     hist = st.session_state.history[strategy]
     all_history.extend(hist)
     with st.expander(f"{strategy} · {len(hist)} closed trades", expanded=False):
@@ -423,10 +509,10 @@ if st.button("♻️ Reset account to 10,000 USDT", disabled=not confirm_reset):
     st.session_state.balance = 10000.0
     st.session_state.initial_balance = 10000.0
     st.session_state.positions = []
-    st.session_state.history = {"HA Micro": [], "5-Candle Breakout": []}
+    st.session_state.history = {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []}
     st.session_state.monitor_messages = []
-    st.session_state.scan_results = {"HA Micro": [], "5-Candle Breakout": []}
-    st.session_state.scan_errors = {"HA Micro": [], "5-Candle Breakout": []}
+    st.session_state.scan_results = {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []}
+    st.session_state.scan_errors = {"HA Micro": [], "5-Candle Breakout": [], "HA Early Momentum": []}
     save_state_to_db()
     st.success("Paper account reset to 10,000 USDT and saved.")
     st.rerun()
